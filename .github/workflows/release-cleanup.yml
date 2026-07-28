@@ -1,0 +1,31 @@
+name: Cleanup old releases
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "Quantas releases publicadas da série build-* manter (mínimo 1)"
+        required: false
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: morphe-release-management
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Apagar releases e tags antigas
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: ${{ inputs.keep }}
+        run: python3 scripts/cleanup_releases.py
