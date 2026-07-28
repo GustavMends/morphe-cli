@@ -1,41 +1,54 @@
-# apps.yml
-#
-# Lista de apps que o workflow deve baixar e patchear (via Morphe).
-# Cada entrada vira um item da matrix do job `build` no GitHub Actions.
-#
-# O download do APK em si NÃO acontece mais direto do Uptodown na CI (os
-# runners do GitHub são bloqueados por IP/ASN de datacenter, retornando 410).
-# O fluxo agora é:
-#   1) Você baixa o APK localmente com scripts/uptodown_dl.py (do seu IP
-#      residencial, que funciona normalmente).
-#   2) Você sobe esse APK como asset de uma Release no seu repo espelho
-#      (https://github.com/GustavoMends/apkmirror), com uma tag própria.
-#   3) O workflow baixa o asset dessa Release (tráfego GitHub -> GitHub,
-#      sem bloqueio) e aplica o patch normalmente.
-#
-# Campos:
-#   name          - identificador curto, usado em nomes de arquivo (sem espaços)
-#   uptodown_url  - URL base da página do app no Uptodown (referência p/ o passo manual)
-#   version       - versão exata (referência p/ o passo manual e para nomear a tag)
-#   patches_repo  - repo GitHub (owner/repo) de onde a última release do .mpp será baixada
-#   output_name   - nome base do APK final (sem extensão)
-#   mirror_repo   - repo espelho (owner/repo) onde você sobe o APK baixado manualmente
-#   mirror_tag    - tag da Release no repo espelho que contém o APK desta versão
-#   mirror_asset  - nome exato do arquivo (asset) anexado a essa Release
-
 apps:
-  - name: youtube
-    version: "21.29.366"
-    patches_repo: MorpheApp/morphe-patches
-    output_name: youtube
-    mirror_repo: GustavoMends/apkmirror
-    mirror_tag: youtube-21.29.366
-    mirror_asset: youtube-21.29.366.apk
-
   - name: instagram
-    version: "435.0.0.37.76"
+    display_name: Instagram
+    version: "439.0.0.37.89"
     patches_repo: crimera/piko
     output_name: instagram
-    mirror_repo: GustavoMends/apkmirror
-    mirror_tag: instagram-435.0.0.37.76
-    mirror_asset: instagram-435.0.0.37.76.apkm
+    mirror_repo: GustavMends/apkmirror
+    mirror_tag: instagram-439.0.0.37.89
+    mirror_asset: instagram-439.0.0.37.89.apkm
+
+  - name: reddit
+    display_name: Reddit
+    version: "2026.14.0"
+    patches_repo: MorpheApp/morphe-patches
+    output_name: reddit
+    mirror_repo: GustavMends/apkmirror
+    mirror_tag: reddit-2026.14.0
+    mirror_asset: reddit-2026.14.0.apkm
+
+  - name: tiktok
+    display_name: TikTok
+    version: "46.2.3"
+    patches_repo: icysymmetra/tiktok-patches-for-morphe
+    output_name: tiktok
+    mirror_repo: GustavMends/apkmirror
+    mirror_tag: tiktok-46.2.3
+    mirror_asset: tiktok-46.2.3.apk
+
+  - name: twitter
+    display_name: Twitter
+    version: "12.19.1-release.0"
+    patches_repo: crimera/piko
+    output_name: twitter
+    mirror_repo: GustavMends/apkmirror
+    mirror_tag: twitter-12.19.1-release.0
+    mirror_asset: twitter-12.19.1-release.0.apkm
+
+  - name: youtube-music
+    display_name: YouTubeMusic
+    version: "9.15.51"
+    patches_repo: MorpheApp/morphe-patches
+    output_name: youtube-music
+    mirror_repo: GustavMends/apkmirror
+    mirror_tag: youtube-music-9.15.51
+    mirror_asset: youtube-music-9.15.51.apk
+
+  - name: youtube
+    display_name: YouTube
+    version: "21.07.247"
+    patches_repo: MorpheApp/morphe-patches
+    output_name: youtube
+    mirror_repo: GustavMends/apkmirror
+    mirror_tag: youtube-21.07.247
+    mirror_asset: youtube-21.07.247.apk
