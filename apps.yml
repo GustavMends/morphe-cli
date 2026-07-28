@@ -1,0 +1,41 @@
+# apps.yml
+#
+# Lista de apps que o workflow deve baixar e patchear (via Morphe).
+# Cada entrada vira um item da matrix do job `build` no GitHub Actions.
+#
+# O download do APK em si NÃO acontece mais direto do Uptodown na CI (os
+# runners do GitHub são bloqueados por IP/ASN de datacenter, retornando 410).
+# O fluxo agora é:
+#   1) Você baixa o APK localmente com scripts/uptodown_dl.py (do seu IP
+#      residencial, que funciona normalmente).
+#   2) Você sobe esse APK como asset de uma Release no seu repo espelho
+#      (https://github.com/GustavoMends/apkmirror), com uma tag própria.
+#   3) O workflow baixa o asset dessa Release (tráfego GitHub -> GitHub,
+#      sem bloqueio) e aplica o patch normalmente.
+#
+# Campos:
+#   name          - identificador curto, usado em nomes de arquivo (sem espaços)
+#   uptodown_url  - URL base da página do app no Uptodown (referência p/ o passo manual)
+#   version       - versão exata (referência p/ o passo manual e para nomear a tag)
+#   patches_repo  - repo GitHub (owner/repo) de onde a última release do .mpp será baixada
+#   output_name   - nome base do APK final (sem extensão)
+#   mirror_repo   - repo espelho (owner/repo) onde você sobe o APK baixado manualmente
+#   mirror_tag    - tag da Release no repo espelho que contém o APK desta versão
+#   mirror_asset  - nome exato do arquivo (asset) anexado a essa Release
+
+apps:
+  - name: youtube
+    version: "21.29.366"
+    patches_repo: MorpheApp/morphe-patches
+    output_name: youtube
+    mirror_repo: GustavoMends/apkmirror
+    mirror_tag: youtube-21.29.366
+    mirror_asset: youtube-21.29.366.apk
+
+  - name: instagram
+    version: "435.0.0.37.76"
+    patches_repo: crimera/piko
+    output_name: instagram
+    mirror_repo: GustavoMends/apkmirror
+    mirror_tag: instagram-435.0.0.37.76
+    mirror_asset: instagram-435.0.0.37.76.apkm
