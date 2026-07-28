@@ -1,0 +1,341 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      release_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências Python
+        run: pip install pyyaml
+
+      - name: Montar matriz de apps
+        id: set-matrix
+        run: |
+          python3 -c "
+          import json, yaml
+          with open('apps.yml') as f:
+              data = yaml.safe_load(f)
+          print(json.dumps({'include': data['apps']}))
+          " > matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Gerar tag da release
+        id: tag
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CURRENT_TAG=$(gh release list -L 1 | awk -F '\t' '{print $3}')
+          if [ -z "$CURRENT_TAG" ]; then CURRENT_TAG=0; fi
+          echo "tag=$((CURRENT_TAG + 1))" >> "$GITHUB_OUTPUT"
+
+  create-release:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Criar release no GitHub
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: "Build ${{ needs.prepare.outputs.release_tag }}"
+
+  build:
+    needs: [prepare, create-release]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Preparar keystore
+        env:
+          MORPHE_KEYSTORE_B64: ${{ secrets.MORPHE_KEYSTORE_B64 }}
+        run: |
+          set -e
+          echo "$MORPHE_KEYSTORE_B64" | base64 -d > "$HOME/imported.keystore"
+          echo MORPHE_KEYSTORE_FILE="$HOME/imported.keystore" >> "$GITHUB_ENV"
+
+      - name: Resolver versão do Morphe Desktop
+        id: morphe-desktop-meta
+        run: |
+          set -e
+          RELEASE_JSON=$(curl -s https://api.github.com/repos/MorpheApp/morphe-desktop/releases/latest)
+          JAR_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("-all\\.jar$")) | .browser_download_url')
+          JAR_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          if [ -z "$JAR_URL" ] || [ "$JAR_URL" = "null" ]; then
+            echo "Não encontrei o asset *-all.jar na release do morphe-desktop" >&2
+            exit 1
+          fi
+          echo "jar_url=${JAR_URL}" >> "$GITHUB_OUTPUT"
+          echo "jar_tag=${JAR_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache do Morphe Desktop (${{ steps.morphe-desktop-meta.outputs.jar_tag }})
+        id: cache-morphe-desktop
+        uses: actions/cache@v5
+        with:
+          path: morphe-desktop-all.jar
+          key: morphe-desktop-${{ steps.morphe-desktop-meta.outputs.jar_tag }}
+
+      - name: Baixar Morphe Desktop (cache miss)
+        if: steps.cache-morphe-desktop.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          echo "Baixando ${{ steps.morphe-desktop-meta.outputs.jar_url }}"
+          curl -L -o morphe-desktop-all.jar "${{ steps.morphe-desktop-meta.outputs.jar_url }}"
+
+      - name: Resolver versão dos patches (${{ matrix.patches_repo }})
+        id: patches-meta
+        run: |
+          set -e
+          RELEASE_JSON=$(curl -s "https://api.github.com/repos/${{ matrix.patches_repo }}/releases/latest")
+
+          PATCH_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".mpp")) | .browser_download_url')
+          if [ -z "$PATCH_URL" ] || [ "$PATCH_URL" = "null" ]; then
+            echo "Não encontrei nenhum asset .mpp na release de ${{ matrix.patches_repo }}" >&2
+            exit 1
+          fi
+
+          PATCHES_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
+          REPO_SLUG=$(echo "${{ matrix.patches_repo }}" | tr '/' '-')
+          echo "$RELEASE_JSON" | jq -r '.body // ""' > "changelog-${{ matrix.name }}.md"
+
+          echo "patch_url=${PATCH_URL}" >> "$GITHUB_OUTPUT"
+          echo "patches_version=${PATCHES_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "repo_slug=${REPO_SLUG}" >> "$GITHUB_OUTPUT"
+          echo "PATCHES_VERSION=${PATCHES_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Cache dos patches (${{ matrix.patches_repo }} · ${{ steps.patches-meta.outputs.patches_version }})
+        id: cache-patches
+        uses: actions/cache@v5
+        with:
+          path: patches-${{ matrix.name }}.mpp
+          key: patches-${{ steps.patches-meta.outputs.repo_slug }}-${{ steps.patches-meta.outputs.patches_version }}
+
+      - name: Baixar patches (cache miss)
+        if: steps.cache-patches.outputs.cache-hit != 'true'
+        run: |
+          set -e
+          curl -L -o "patches-${{ matrix.name }}.mpp" "${{ steps.patches-meta.outputs.patch_url }}"
+
+      - name: Resolver asset do repo espelho (${{ matrix.mirror_repo }} · ${{ matrix.mirror_tag }})
+        id: mirror-meta
+        env:
+          MIRROR_REPO_TOKEN: ${{ secrets.MIRROR_REPO_TOKEN }}
+        run: |
+          set -e
+          ASSET_JSON=$(curl -s \
+            -H "Authorization: token ${MIRROR_REPO_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ matrix.mirror_repo }}/releases/tags/${{ matrix.mirror_tag }}" \
+            | jq -r --arg name "${{ matrix.mirror_asset }}" '.assets[] | select(.name == $name)')
+
+          if [ -z "$ASSET_JSON" ] || [ "$ASSET_JSON" = "null" ]; then
+            echo "Não encontrei o asset '${{ matrix.mirror_asset }}' na tag '${{ matrix.mirror_tag }}' de ${{ matrix.mirror_repo }}" >&2
+            echo "Confira se você já subiu o APK dessa versão no repo espelho." >&2
+            exit 1
+          fi
+
+          ASSET_URL=$(echo "$ASSET_JSON" | jq -r '.url')
+          ASSET_ID=$(echo "$ASSET_JSON" | jq -r '.id')
+
+          ASSET_NAME="${{ matrix.mirror_asset }}"
+          EXT="${ASSET_NAME##*.}"
+          INPUT_FILE="${{ matrix.output_name }}.${EXT}"
+
+          echo "asset_url=${ASSET_URL}" >> "$GITHUB_OUTPUT"
+          echo "asset_id=${ASSET_ID}" >> "$GITHUB_OUTPUT"
+          echo "input_file=${INPUT_FILE}" >> "$GITHUB_OUTPUT"
+          echo "INPUT_FILE=${INPUT_FILE}" >> "$GITHUB_ENV"
+
+      - name: Cache do APK (${{ matrix.mirror_tag }})
+        id: cache-apk
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.mirror-meta.outputs.input_file }}
+          key: apk-${{ matrix.name }}-${{ matrix.mirror_tag }}-${{ steps.mirror-meta.outputs.asset_id }}
+
+      - name: Baixar APK (cache miss)
+        if: steps.cache-apk.outputs.cache-hit != 'true'
+        env:
+          MIRROR_REPO_TOKEN: ${{ secrets.MIRROR_REPO_TOKEN }}
+        run: |
+          set -e
+          curl -L \
+            -H "Authorization: token ${MIRROR_REPO_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            -o "${{ steps.mirror-meta.outputs.input_file }}" \
+            "${{ steps.mirror-meta.outputs.asset_url }}"
+
+      - name: Aplicar patches (${{ matrix.name }} ${{ matrix.version }})
+        env:
+          MORPHE_KEYSTORE_ALIAS: ${{ secrets.MORPHE_KEYSTORE_ALIAS }}
+          MORPHE_KEYSTORE_PASSWORD: ${{ secrets.MORPHE_KEYSTORE_PASSWORD }}
+        run: |
+          set -e
+          cd "$HOME"
+          java -jar "${{ github.workspace }}/morphe-desktop-all.jar" patch \
+            -p "${{ github.workspace }}/patches-${{ matrix.name }}.mpp" \
+            --keystore="$MORPHE_KEYSTORE_FILE" --keystore-entry-alias="$MORPHE_KEYSTORE_ALIAS" \
+            --keystore-entry-password="$MORPHE_KEYSTORE_PASSWORD" --keystore-password="$MORPHE_KEYSTORE_PASSWORD" \
+            -o "${{ github.workspace }}/${{ matrix.output_name }}-morphe.apk" \
+            "${{ github.workspace }}/${{ env.INPUT_FILE }}"
+
+      - name: Nomear APK
+        run: |
+          set -e
+          ASSET_BASENAME="${{ matrix.display_name }}-${{ matrix.version }}-${{ env.PATCHES_VERSION }}"
+          FINAL_APK="${ASSET_BASENAME}.apk"
+          mv "${{ matrix.output_name }}-morphe.apk" "${FINAL_APK}"
+          echo "FINAL_APK=${FINAL_APK}" >> "$GITHUB_ENV"
+
+      - name: Upload para o GoFile
+        env:
+          GOFILE_API_TOKEN: ${{ secrets.GOFILE_API_TOKEN }}
+        run: |
+          set -e
+          if [ -n "${GOFILE_API_TOKEN}" ]; then
+            RESPONSE=$(curl -s "https://upload.gofile.io/uploadFile" \
+              -F "file=@${{ env.FINAL_APK }}" \
+              -F "token=${GOFILE_API_TOKEN}")
+          else
+            RESPONSE=$(curl -s "https://upload.gofile.io/uploadFile" \
+              -F "file=@${{ env.FINAL_APK }}")
+          fi
+
+          GOFILE_URL=$(echo "$RESPONSE" | jq -r '.data.downloadPage // empty')
+          if [ -z "$GOFILE_URL" ]; then
+            echo "Aviso: upload para o GoFile falhou ou não retornou link. Resposta: $RESPONSE" >&2
+          fi
+          echo "GOFILE_URL=${GOFILE_URL}" >> "$GITHUB_ENV"
+
+      - name: Gerar metadados
+        run: |
+          set -e
+          CHANGELOG_CONTENT=$(cat "changelog-${{ matrix.name }}.md")
+          jq -n \
+            --arg name "${{ matrix.name }}" \
+            --arg display_name "${{ matrix.display_name }}" \
+            --arg version "${{ matrix.version }}" \
+            --arg patches_repo "${{ matrix.patches_repo }}" \
+            --arg patches_version "${{ env.PATCHES_VERSION }}" \
+            --arg changelog "$CHANGELOG_CONTENT" \
+            --arg gofile_url "${{ env.GOFILE_URL }}" \
+            --arg asset_name "${{ env.FINAL_APK }}" \
+            '{name:$name, display_name:$display_name, version:$version, patches_repo:$patches_repo, patches_version:$patches_version, changelog:$changelog, gofile_url:$gofile_url, asset_name:$asset_name}' \
+            > "meta-${{ matrix.name }}.json"
+
+      - name: Publicar APK e metadados
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.prepare.outputs.release_tag }}
+          name: "Build ${{ needs.prepare.outputs.release_tag }}"
+          files: |
+            ${{ env.FINAL_APK }}
+            meta-${{ matrix.name }}.json
+
+  aggregate-release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Baixar metadados
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          mkdir -p meta
+          gh release download "${{ needs.prepare.outputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern 'meta-*.json' \
+            --dir meta
+
+      - name: Configurar Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Montar título e descrição da release
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: python3 scripts/build_release_notes.py
+
+      - name: Atualizar título e descrição da release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          gh release edit "${{ needs.prepare.outputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "$(cat release-title.txt)" \
+            --notes-file release-body.md
+
+      - name: Remover metadados
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          for f in meta/meta-*.json; do
+            asset_name="$(basename "$f")"
+            echo "Removendo asset temporário: $asset_name"
+            gh release delete-asset "${{ needs.prepare.outputs.release_tag }}" "$asset_name" \
+              --repo "${{ github.repository }}" \
+              --yes
+          done
+
+  notify:
+    needs: [prepare, create-release, build, aggregate-release]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enviar notificação no Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          PREPARE_STATUS="${{ needs.prepare.result }}"
+          RELEASE_STATUS="${{ needs['create-release'].result }}"
+          BUILD_STATUS="${{ needs.build.result }}"
+          AGGREGATE_STATUS="${{ needs['aggregate-release'].result }}"
+          TAG="${{ needs.prepare.outputs.release_tag }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          if [ "$PREPARE_STATUS" = "success" ] && [ "$RELEASE_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$AGGREGATE_STATUS" = "success" ]; then
+            TEXT="✅ Build concluído com sucesso%0ARelease: https://github.com/${{ github.repository }}/releases/tag/$TAG"
+          else
+            if [ "$PREPARE_STATUS" != "success" ]; then
+              STAGE="prepare"
+            elif [ "$RELEASE_STATUS" != "success" ]; then
+              STAGE="create-release"
+            elif [ "$BUILD_STATUS" != "success" ]; then
+              STAGE="build"
+            else
+              STAGE="aggregate-release"
+            fi
+            TEXT="❌ Build falhou%0ARun: $RUN_URL%0AStage: $STAGE"
+          fi
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="$TEXT"
