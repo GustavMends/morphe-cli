@@ -1,0 +1,41 @@
+name: Cleanup old releases
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: "Quantas releases/tags mais recentes manter"
+        required: false
+        default: "3"
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Apagar releases e tags antigas
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KEEP: ${{ github.event.inputs.keep }}
+        run: |
+          set -e
+          mapfile -t tags < <(
+            gh release list --repo "${{ github.repository }}" --limit 100 \
+              --json tagName,createdAt \
+              --jq "sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName"
+          )
+
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo "Nada para apagar (${KEEP} releases mais recentes preservadas)."
+            exit 0
+          fi
+
+          echo "Mantendo as ${KEEP} releases/tags mais recentes."
+          echo "Releases/tags a apagar (${#tags[@]}):"
+          printf '  - %s\n' "${tags[@]}"
+
+          for tag in "${tags[@]}"; do
+            echo "Apagando: $tag"
+            gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag --yes
+          done

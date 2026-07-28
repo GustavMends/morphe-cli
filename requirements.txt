@@ -1,0 +1,7 @@
+curl_cffi
+beautifulsoup4
+lxml
+requests
+tqdm
+cloudscraper
+PyYAML
