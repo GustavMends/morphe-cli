@@ -1,0 +1,318 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: morphe-release-management
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      release_tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependências Python
+        run: pip install pyyaml
+
+      - name: Montar matriz de apps
+        id: set-matrix
+        run: |
+          python3 -c "
+          import json, yaml
+          with open('apps.yml') as f:
+              data = yaml.safe_load(f)
+          print(json.dumps({'include': data['apps']}))
+          " > matrix.json
+          echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Resolver entradas da execução
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MIRROR_REPO_TOKEN: ${{ secrets.MIRROR_REPO_TOKEN }}
+        run: python3 scripts/github_assets.py resolve
+
+      - name: Compartilhar entradas resolvidas
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: resolved-inputs-${{ github.run_id }}
+          path: resolved-inputs.json
+          overwrite: true
+          if-no-files-found: error
+
+      - name: Identificar release da execução
+        id: tag
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          echo "tag=build-${RUN_ID}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: ${{ matrix.name }}
+      APP_DISPLAY_NAME: ${{ matrix.display_name }}
+      APP_VERSION: ${{ matrix.version }}
+      PATCHES_REPO: ${{ matrix.patches_repo }}
+      OUTPUT_NAME: ${{ matrix.output_name }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Baixar entradas resolvidas
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: resolved-inputs-${{ github.run_id }}
+
+      - name: Carregar entradas do app
+        id: inputs
+        env:
+          APP_NAME: ${{ matrix.name }}
+        run: python3 scripts/github_assets.py export --name "$APP_NAME"
+
+      - name: Configurar Java 21
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Cache do Morphe Desktop (${{ steps.inputs.outputs.jar_tag }})
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: morphe-desktop-all.jar
+          key: morphe-desktop-${{ steps.inputs.outputs.jar_tag }}-${{ steps.inputs.outputs.jar_id }}
+
+      - name: Baixar ou verificar Morphe Desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ matrix.name }}
+        run: python3 scripts/github_assets.py fetch --name "$APP_NAME" --kind cli
+
+      - name: Cache dos patches (${{ matrix.patches_repo }} · ${{ steps.inputs.outputs.patches_version }})
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: patches-${{ matrix.name }}.mpp
+          key: patches-${{ steps.inputs.outputs.repo_slug }}-${{ steps.inputs.outputs.patches_version }}-${{ steps.inputs.outputs.patches_id }}
+
+      - name: Baixar ou verificar patches
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ matrix.name }}
+        run: python3 scripts/github_assets.py fetch --name "$APP_NAME" --kind patches
+
+      - name: Cache do APK (${{ matrix.mirror_tag }})
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25
+        with:
+          path: ${{ steps.inputs.outputs.input_file }}
+          key: apk-${{ matrix.name }}-${{ matrix.mirror_tag }}-${{ steps.inputs.outputs.asset_id }}
+
+      - name: Baixar ou verificar APK
+        env:
+          MIRROR_REPO_TOKEN: ${{ secrets.MIRROR_REPO_TOKEN }}
+          APP_NAME: ${{ matrix.name }}
+        run: python3 scripts/github_assets.py fetch --name "$APP_NAME" --kind apk
+
+      - name: Preparar keystore
+        env:
+          MORPHE_KEYSTORE_B64: ${{ secrets.MORPHE_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          umask 077
+          printf '%s' "$MORPHE_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/imported.keystore"
+          echo "MORPHE_KEYSTORE_FILE=$RUNNER_TEMP/imported.keystore" >> "$GITHUB_ENV"
+
+      - name: Aplicar patches (${{ matrix.name }} ${{ matrix.version }})
+        env:
+          MORPHE_KEYSTORE_ALIAS: ${{ secrets.MORPHE_KEYSTORE_ALIAS }}
+          MORPHE_KEYSTORE_PASSWORD: ${{ secrets.MORPHE_KEYSTORE_PASSWORD }}
+        run: |
+          set -e
+          cd "$HOME"
+          java -jar "$GITHUB_WORKSPACE/morphe-desktop-all.jar" patch \
+            -p "$GITHUB_WORKSPACE/patches-${APP_NAME}.mpp" \
+            --keystore="$MORPHE_KEYSTORE_FILE" --keystore-entry-alias="$MORPHE_KEYSTORE_ALIAS" \
+            --keystore-entry-password="$MORPHE_KEYSTORE_PASSWORD" --keystore-password="$MORPHE_KEYSTORE_PASSWORD" \
+            -o "$GITHUB_WORKSPACE/${OUTPUT_NAME}-morphe.apk" \
+            "$GITHUB_WORKSPACE/$INPUT_FILE"
+
+      - name: Remover keystore temporário
+        if: always()
+        run: rm -f -- "$RUNNER_TEMP/imported.keystore"
+
+      - name: Nomear APK
+        run: |
+          set -e
+          ASSET_BASENAME=$(printf '%s' "${APP_DISPLAY_NAME}-${APP_VERSION}-${PATCHES_VERSION}" | LC_ALL=C tr -c 'A-Za-z0-9._-' '_')
+          FINAL_APK="${ASSET_BASENAME}.apk"
+          mv -- "${OUTPUT_NAME}-morphe.apk" "${FINAL_APK}"
+          echo "FINAL_APK=${FINAL_APK}" >> "$GITHUB_ENV"
+
+      - name: Upload para o GoFile / PixelDrain
+        env:
+          GOFILE_API_TOKEN: ${{ secrets.GOFILE_API_TOKEN }}
+          PIXELDRAIN_API_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
+        run: |
+          set +e
+          set +o pipefail
+          MIRROR_URL=""
+          MIRROR_LABEL=""
+          CURL_OPTS="--silent --show-error --max-time 300 --connect-timeout 15"
+
+          if [ -n "${GOFILE_API_TOKEN}" ]; then
+            GOFILE_RESPONSE=$(curl $CURL_OPTS "https://upload.gofile.io/uploadFile" \
+              -F "file=@${FINAL_APK}" \
+              -F "token=${GOFILE_API_TOKEN}" 2>&1) || GOFILE_RESPONSE=""
+          else
+            GOFILE_RESPONSE=$(curl $CURL_OPTS "https://upload.gofile.io/uploadFile" \
+              -F "file=@${FINAL_APK}" 2>&1) || GOFILE_RESPONSE=""
+          fi
+          GOFILE_LINK=$(echo "$GOFILE_RESPONSE" | jq -r '.data.downloadPage // empty' 2>/dev/null)
+
+          if [[ "$GOFILE_LINK" == https://* && "$GOFILE_LINK" != *$'\n'* && "$GOFILE_LINK" != *$'\r'* ]]; then
+            MIRROR_URL="$GOFILE_LINK"
+            MIRROR_LABEL="GoFile"
+            echo "Upload para o GoFile OK: $MIRROR_URL"
+          else
+            echo "Aviso: GoFile falhou ou não retornou link. Resposta: $GOFILE_RESPONSE" >&2
+
+            if [ -n "${PIXELDRAIN_API_KEY}" ]; then
+              PD_RESPONSE=$(curl $CURL_OPTS -T "${FINAL_APK}" \
+                -u ":${PIXELDRAIN_API_KEY}" \
+                "https://pixeldrain.com/api/file/" 2>&1) || PD_RESPONSE=""
+              PD_SUCCESS=$(echo "$PD_RESPONSE" | jq -r '.success // false' 2>/dev/null)
+              PD_ID=$(echo "$PD_RESPONSE" | jq -r '.id // empty' 2>/dev/null)
+
+              if [ "$PD_SUCCESS" = "true" ] && [[ "$PD_ID" =~ ^[A-Za-z0-9_-]+$ ]]; then
+                MIRROR_URL="https://pixeldrain.com/u/${PD_ID}"
+                MIRROR_LABEL="PixelDrain"
+                echo "Upload para o PixelDrain OK: $MIRROR_URL"
+              else
+                echo "Aviso: PixelDrain também falhou. Resposta: $PD_RESPONSE" >&2
+              fi
+            else
+              echo "PIXELDRAIN_API_KEY não configurado — pulando fallback do PixelDrain."
+            fi
+          fi
+
+          if [ -z "$MIRROR_URL" ]; then
+            echo "Nenhum mirror disponível pra esta build — só o GitHub Release mesmo, sem problema."
+          fi
+
+          echo "MIRROR_URL=${MIRROR_URL}" >> "$GITHUB_ENV"
+          echo "MIRROR_LABEL=${MIRROR_LABEL}" >> "$GITHUB_ENV"
+
+      - name: Gerar metadados
+        run: |
+          set -e
+          jq -n \
+            --arg name "$APP_NAME" \
+            --arg display_name "$APP_DISPLAY_NAME" \
+            --arg version "$APP_VERSION" \
+            --arg patches_repo "$PATCHES_REPO" \
+            --arg patches_version "$PATCHES_VERSION" \
+            --rawfile changelog "changelog-${APP_NAME}.md" \
+            --arg mirror_url "$MIRROR_URL" \
+            --arg mirror_label "$MIRROR_LABEL" \
+            --arg asset_name "$FINAL_APK" \
+            '{name:$name, display_name:$display_name, version:$version, patches_repo:$patches_repo, patches_version:$patches_version, changelog:$changelog, mirror_url:$mirror_url, mirror_label:$mirror_label, asset_name:$asset_name}' \
+            > "meta-${APP_NAME}.json"
+
+      - name: Entregar APK e metadados para publicação
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: build-${{ github.run_id }}-${{ matrix.name }}
+          overwrite: true
+          if-no-files-found: error
+          path: |
+            ${{ env.FINAL_APK }}
+            meta-${{ matrix.name }}.json
+
+  aggregate-release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Baixar resultados da matriz
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          pattern: build-${{ github.run_id }}-*
+          path: artifacts
+
+      - name: Configurar Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: "3.12"
+
+      - name: Conferir conjunto completo de resultados
+        env:
+          MATRIX_JSON: ${{ needs.prepare.outputs.matrix }}
+        run: python3 scripts/collect_release.py
+
+      - name: Montar título e descrição da release
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: python3 scripts/build_release_notes.py
+
+      - name: Publicar release completa
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          python3 scripts/publish_release.py
+
+  notify:
+    needs: [prepare, build, aggregate-release]
+    if: always()
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Enviar notificação no Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PREPARE_STATUS: ${{ needs.prepare.result }}
+          BUILD_STATUS: ${{ needs.build.result }}
+          AGGREGATE_STATUS: ${{ needs['aggregate-release'].result }}
+          RELEASE_URL: https://github.com/${{ github.repository }}/releases/tag/${{ needs.prepare.outputs.release_tag }}
+          RUN_URL: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ "$PREPARE_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$AGGREGATE_STATUS" = "success" ]; then
+            TEXT="✅ Build concluído com sucesso%0ARelease: $RELEASE_URL"
+          else
+            if [ "$PREPARE_STATUS" != "success" ]; then
+              STAGE="prepare"
+            elif [ "$BUILD_STATUS" != "success" ]; then
+              STAGE="build"
+            else
+              STAGE="aggregate-release"
+            fi
+            TEXT="❌ Build falhou%0ARun: $RUN_URL%0AStage: $STAGE"
+          fi
+
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="$TEXT"
