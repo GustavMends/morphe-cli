@@ -3,39 +3,28 @@ on:
   workflow_dispatch:
     inputs:
       keep:
-        description: "Quantas releases/tags mais recentes manter"
+        description: "Quantas releases publicadas da série build-* manter (mínimo 1)"
         required: false
         default: "3"
 
 permissions:
-  contents: write
+  contents: read
+
+# Serialize with build.yml, including retries and draft publication.
+concurrency:
+  group: morphe-release-management
+  cancel-in-progress: false
 
 jobs:
   cleanup:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v7
+
       - name: Apagar releases e tags antigas
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          KEEP: ${{ github.event.inputs.keep }}
-        run: |
-          set -e
-          mapfile -t tags < <(
-            gh release list --repo "${{ github.repository }}" --limit 100 \
-              --json tagName,createdAt \
-              --jq "sort_by(.createdAt) | reverse | .[${KEEP}:] | .[].tagName"
-          )
-
-          if [ "${#tags[@]}" -eq 0 ]; then
-            echo "Nada para apagar (${KEEP} releases mais recentes preservadas)."
-            exit 0
-          fi
-
-          echo "Mantendo as ${KEEP} releases/tags mais recentes."
-          echo "Releases/tags a apagar (${#tags[@]}):"
-          printf '  - %s\n' "${tags[@]}"
-
-          for tag in "${tags[@]}"; do
-            echo "Apagando: $tag"
-            gh release delete "$tag" --repo "${{ github.repository }}" --cleanup-tag --yes
-          done
+          KEEP: ${{ inputs.keep }}
+        run: python3 scripts/cleanup_releases.py
