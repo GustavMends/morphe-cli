@@ -4,7 +4,12 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+# Shared with release-cleanup.yml so cleanup cannot race a build or publication.
+concurrency:
+  group: morphe-release-management
+  cancel-in-progress: false
 
 jobs:
   prepare:
@@ -33,27 +38,15 @@ jobs:
           " > matrix.json
           echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
 
-      - name: Gerar tag da release
+      - name: Identificar release da execução
         id: tag
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
         run: |
-          CURRENT_TAG=$(gh release list -L 1 | awk -F '\t' '{print $3}')
-          if [ -z "$CURRENT_TAG" ]; then CURRENT_TAG=0; fi
-          echo "tag=$((CURRENT_TAG + 1))" >> "$GITHUB_OUTPUT"
-
-  create-release:
-    needs: prepare
-    runs-on: ubuntu-latest
-    steps:
-      - name: Criar release no GitHub
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ needs.prepare.outputs.release_tag }}
-          name: "Build ${{ needs.prepare.outputs.release_tag }}"
+          echo "tag=build-${RUN_ID}" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: [prepare, create-release]
+    needs: prepare
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -279,36 +272,39 @@ jobs:
             '{name:$name, display_name:$display_name, version:$version, patches_repo:$patches_repo, patches_version:$patches_version, changelog:$changelog, mirror_url:$mirror_url, mirror_label:$mirror_label, asset_name:$asset_name}' \
             > "meta-${{ matrix.name }}.json"
 
-      - name: Publicar APK e metadados
-        uses: softprops/action-gh-release@v3
+      - name: Entregar APK e metadados para publicação
+        uses: actions/upload-artifact@v7
         with:
-          tag_name: ${{ needs.prepare.outputs.release_tag }}
-          name: "Build ${{ needs.prepare.outputs.release_tag }}"
-          files: |
+          name: build-${{ github.run_id }}-${{ matrix.name }}
+          overwrite: true
+          if-no-files-found: error
+          path: |
             ${{ env.FINAL_APK }}
             meta-${{ matrix.name }}.json
 
   aggregate-release:
     needs: [prepare, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
 
-      - name: Baixar metadados
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          mkdir -p meta
-          gh release download "${{ needs.prepare.outputs.release_tag }}" \
-            --repo "${{ github.repository }}" \
-            --pattern 'meta-*.json' \
-            --dir meta
+      - name: Baixar resultados da matriz
+        uses: actions/download-artifact@v8
+        with:
+          pattern: build-${{ github.run_id }}-*
+          path: artifacts
 
       - name: Configurar Python
         uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+
+      - name: Conferir conjunto completo de resultados
+        env:
+          MATRIX_JSON: ${{ needs.prepare.outputs.matrix }}
+        run: python3 scripts/collect_release.py
 
       - name: Montar título e descrição da release
         env:
@@ -316,31 +312,15 @@ jobs:
           TAG: ${{ needs.prepare.outputs.release_tag }}
         run: python3 scripts/build_release_notes.py
 
-      - name: Atualizar título e descrição da release
+      - name: Publicar release completa
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.release_tag }}
         run: |
-          set -e
-          gh release edit "${{ needs.prepare.outputs.release_tag }}" \
-            --repo "${{ github.repository }}" \
-            --title "$(cat release-title.txt)" \
-            --notes-file release-body.md
-
-      - name: Remover metadados
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -e
-          for f in meta/meta-*.json; do
-            asset_name="$(basename "$f")"
-            echo "Removendo asset temporário: $asset_name"
-            gh release delete-asset "${{ needs.prepare.outputs.release_tag }}" "$asset_name" \
-              --repo "${{ github.repository }}" \
-              --yes
-          done
+          python3 scripts/publish_release.py
 
   notify:
-    needs: [prepare, create-release, build, aggregate-release]
+    needs: [prepare, build, aggregate-release]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -350,19 +330,16 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           PREPARE_STATUS="${{ needs.prepare.result }}"
-          RELEASE_STATUS="${{ needs['create-release'].result }}"
           BUILD_STATUS="${{ needs.build.result }}"
           AGGREGATE_STATUS="${{ needs['aggregate-release'].result }}"
           TAG="${{ needs.prepare.outputs.release_tag }}"
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
-          if [ "$PREPARE_STATUS" = "success" ] && [ "$RELEASE_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$AGGREGATE_STATUS" = "success" ]; then
+          if [ "$PREPARE_STATUS" = "success" ] && [ "$BUILD_STATUS" = "success" ] && [ "$AGGREGATE_STATUS" = "success" ]; then
             TEXT="✅ Build concluído com sucesso%0ARelease: https://github.com/${{ github.repository }}/releases/tag/$TAG"
           else
             if [ "$PREPARE_STATUS" != "success" ]; then
               STAGE="prepare"
-            elif [ "$RELEASE_STATUS" != "success" ]; then
-              STAGE="create-release"
             elif [ "$BUILD_STATUS" != "success" ]; then
               STAGE="build"
             else
