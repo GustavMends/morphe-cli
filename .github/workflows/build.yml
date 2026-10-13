@@ -38,6 +38,20 @@ jobs:
           " > matrix.json
           echo "matrix=$(cat matrix.json)" >> "$GITHUB_OUTPUT"
 
+      - name: Resolver entradas da execução
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MIRROR_REPO_TOKEN: ${{ secrets.MIRROR_REPO_TOKEN }}
+        run: python3 scripts/github_assets.py resolve
+
+      - name: Compartilhar entradas resolvidas
+        uses: actions/upload-artifact@v7
+        with:
+          name: resolved-inputs-${{ github.run_id }}
+          path: resolved-inputs.json
+          overwrite: true
+          if-no-files-found: error
+
       - name: Identificar release da execução
         id: tag
         env:
@@ -54,6 +68,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Baixar entradas resolvidas
+        uses: actions/download-artifact@v8
+        with:
+          name: resolved-inputs-${{ github.run_id }}
+
+      - name: Carregar entradas do app
+        id: inputs
+        env:
+          APP_NAME: ${{ matrix.name }}
+        run: python3 scripts/github_assets.py export --name "$APP_NAME"
+
       - name: Configurar Java 21
         uses: actions/setup-java@v5
         with:
@@ -68,116 +93,41 @@ jobs:
           echo "$MORPHE_KEYSTORE_B64" | base64 -d > "$HOME/imported.keystore"
           echo MORPHE_KEYSTORE_FILE="$HOME/imported.keystore" >> "$GITHUB_ENV"
 
-      - name: Resolver versão do Morphe Desktop
-        id: morphe-desktop-meta
-        run: |
-          set -e
-          RELEASE_JSON=$(curl -s https://api.github.com/repos/MorpheApp/morphe-desktop/releases/latest)
-          JAR_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | test("-all\\.jar$")) | .browser_download_url')
-          JAR_TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
-          if [ -z "$JAR_URL" ] || [ "$JAR_URL" = "null" ]; then
-            echo "Não encontrei o asset *-all.jar na release do morphe-desktop" >&2
-            exit 1
-          fi
-          echo "jar_url=${JAR_URL}" >> "$GITHUB_OUTPUT"
-          echo "jar_tag=${JAR_TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Cache do Morphe Desktop (${{ steps.morphe-desktop-meta.outputs.jar_tag }})
-        id: cache-morphe-desktop
+      - name: Cache do Morphe Desktop (${{ steps.inputs.outputs.jar_tag }})
         uses: actions/cache@v5
         with:
           path: morphe-desktop-all.jar
-          key: morphe-desktop-${{ steps.morphe-desktop-meta.outputs.jar_tag }}
+          key: morphe-desktop-${{ steps.inputs.outputs.jar_tag }}-${{ steps.inputs.outputs.jar_id }}
 
-      - name: Baixar Morphe Desktop (cache miss)
-        if: steps.cache-morphe-desktop.outputs.cache-hit != 'true'
-        run: |
-          set -e
-          echo "Baixando ${{ steps.morphe-desktop-meta.outputs.jar_url }}"
-          curl -L -o morphe-desktop-all.jar "${{ steps.morphe-desktop-meta.outputs.jar_url }}"
+      - name: Baixar ou verificar Morphe Desktop
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ matrix.name }}
+        run: python3 scripts/github_assets.py fetch --name "$APP_NAME" --kind cli
 
-      - name: Resolver versão dos patches (${{ matrix.patches_repo }})
-        id: patches-meta
-        run: |
-          set -e
-          RELEASE_JSON=$(curl -s "https://api.github.com/repos/${{ matrix.patches_repo }}/releases/latest")
-
-          PATCH_URL=$(echo "$RELEASE_JSON" | jq -r '.assets[] | select(.name | endswith(".mpp")) | .browser_download_url')
-          if [ -z "$PATCH_URL" ] || [ "$PATCH_URL" = "null" ]; then
-            echo "Não encontrei nenhum asset .mpp na release de ${{ matrix.patches_repo }}" >&2
-            exit 1
-          fi
-
-          PATCHES_VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
-          REPO_SLUG=$(echo "${{ matrix.patches_repo }}" | tr '/' '-')
-          echo "$RELEASE_JSON" | jq -r '.body // ""' > "changelog-${{ matrix.name }}.md"
-
-          echo "patch_url=${PATCH_URL}" >> "$GITHUB_OUTPUT"
-          echo "patches_version=${PATCHES_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "repo_slug=${REPO_SLUG}" >> "$GITHUB_OUTPUT"
-          echo "PATCHES_VERSION=${PATCHES_VERSION}" >> "$GITHUB_ENV"
-
-      - name: Cache dos patches (${{ matrix.patches_repo }} · ${{ steps.patches-meta.outputs.patches_version }})
-        id: cache-patches
+      - name: Cache dos patches (${{ matrix.patches_repo }} · ${{ steps.inputs.outputs.patches_version }})
         uses: actions/cache@v5
         with:
           path: patches-${{ matrix.name }}.mpp
-          key: patches-${{ steps.patches-meta.outputs.repo_slug }}-${{ steps.patches-meta.outputs.patches_version }}
+          key: patches-${{ steps.inputs.outputs.repo_slug }}-${{ steps.inputs.outputs.patches_version }}-${{ steps.inputs.outputs.patches_id }}
 
-      - name: Baixar patches (cache miss)
-        if: steps.cache-patches.outputs.cache-hit != 'true'
-        run: |
-          set -e
-          curl -L -o "patches-${{ matrix.name }}.mpp" "${{ steps.patches-meta.outputs.patch_url }}"
-
-      - name: Resolver asset do repo espelho (${{ matrix.mirror_repo }} · ${{ matrix.mirror_tag }})
-        id: mirror-meta
+      - name: Baixar ou verificar patches
         env:
-          MIRROR_REPO_TOKEN: ${{ secrets.MIRROR_REPO_TOKEN }}
-        run: |
-          set -e
-          ASSET_JSON=$(curl -s \
-            -H "Authorization: token ${MIRROR_REPO_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/repos/${{ matrix.mirror_repo }}/releases/tags/${{ matrix.mirror_tag }}" \
-            | jq -r --arg name "${{ matrix.mirror_asset }}" '.assets[] | select(.name == $name)')
-
-          if [ -z "$ASSET_JSON" ] || [ "$ASSET_JSON" = "null" ]; then
-            echo "Não encontrei o asset '${{ matrix.mirror_asset }}' na tag '${{ matrix.mirror_tag }}' de ${{ matrix.mirror_repo }}" >&2
-            echo "Confira se você já subiu o APK dessa versão no repo espelho." >&2
-            exit 1
-          fi
-
-          ASSET_URL=$(echo "$ASSET_JSON" | jq -r '.url')
-          ASSET_ID=$(echo "$ASSET_JSON" | jq -r '.id')
-
-          ASSET_NAME="${{ matrix.mirror_asset }}"
-          EXT="${ASSET_NAME##*.}"
-          INPUT_FILE="${{ matrix.output_name }}.${EXT}"
-
-          echo "asset_url=${ASSET_URL}" >> "$GITHUB_OUTPUT"
-          echo "asset_id=${ASSET_ID}" >> "$GITHUB_OUTPUT"
-          echo "input_file=${INPUT_FILE}" >> "$GITHUB_OUTPUT"
-          echo "INPUT_FILE=${INPUT_FILE}" >> "$GITHUB_ENV"
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_NAME: ${{ matrix.name }}
+        run: python3 scripts/github_assets.py fetch --name "$APP_NAME" --kind patches
 
       - name: Cache do APK (${{ matrix.mirror_tag }})
-        id: cache-apk
         uses: actions/cache@v5
         with:
-          path: ${{ steps.mirror-meta.outputs.input_file }}
-          key: apk-${{ matrix.name }}-${{ matrix.mirror_tag }}-${{ steps.mirror-meta.outputs.asset_id }}
+          path: ${{ steps.inputs.outputs.input_file }}
+          key: apk-${{ matrix.name }}-${{ matrix.mirror_tag }}-${{ steps.inputs.outputs.asset_id }}
 
-      - name: Baixar APK (cache miss)
-        if: steps.cache-apk.outputs.cache-hit != 'true'
+      - name: Baixar ou verificar APK
         env:
           MIRROR_REPO_TOKEN: ${{ secrets.MIRROR_REPO_TOKEN }}
-        run: |
-          set -e
-          curl -L \
-            -H "Authorization: token ${MIRROR_REPO_TOKEN}" \
-            -H "Accept: application/octet-stream" \
-            -o "${{ steps.mirror-meta.outputs.input_file }}" \
-            "${{ steps.mirror-meta.outputs.asset_url }}"
+          APP_NAME: ${{ matrix.name }}
+        run: python3 scripts/github_assets.py fetch --name "$APP_NAME" --kind apk
 
       - name: Aplicar patches (${{ matrix.name }} ${{ matrix.version }})
         env:
